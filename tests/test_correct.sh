@@ -18,26 +18,20 @@ bad() { echo "${C_BAD}FAIL${C_0} $1"; fail=$((fail+1)); }
 export SB_SPEED=15000
 pkill -x correct 2>/dev/null; ./correct reset >/dev/null 2>&1; sleep 0.3   # hermetic start
 
-echo "${C_H}== correct test 1: NO LOST WAKEUP (customer added during the gap) ==${C_0}"
-# Identical timing to naive test 1: a 3s dozing-off window, customer added at
-# 0.8s while the barber is mid-gap (NOT yet asleep). In naive this is the moment
-# that loses the customer; here signal(custReady) is remembered even though the
-# barber has not reached wait(custReady) yet, so no wake-up can be lost.
-BARBER_WINDOW=3 ./correct barber 3 </dev/null >/tmp/sb_c1_barber.log 2>&1 &
-bpid=$!
-sleep 0.8                                    # barber is mid-gap, not yet asleep
-printf '\n' | timeout 6 ./correct customer >/tmp/sb_c1_cust.log 2>&1
-rc=$?
-kill $bpid 2>/dev/null; wait $bpid 2>/dev/null
-./correct reset >/dev/null 2>&1
-if [ $rc -eq 0 ] && grep -q "Leaving happy" /tmp/sb_c1_cust.log; then
-    ok "the customer was served — the lost-wakeup bug is gone"
+echo "${C_H}== correct test 1: NO LOST WAKEUP (same real race naive deadlocks on) ==${C_0}"
+# `prove` runs the SAME thread race that ./naive deadlock loses — a sched_yield
+# at the exact race point, no artificial gap — many times over. Where naive
+# deadlocks, signal(custReady) is remembered here, so every customer is served.
+out=$(timeout 30 ./correct prove 2>&1)
+echo "$out" | grep -E "served, 0 lost|NOT served" | sed 's/^/    /'
+if echo "$out" | grep -q "0 lost"; then
+    ok "every customer served across the race — the lost-wakeup bug is gone"
 else
-    bad "expected the customer to be served (rc=0); got rc=$rc"
+    bad "expected 0 lost customers; the fix appears broken"
 fi
 
 echo "${C_H}== correct test 2: FULL WAITING ROOM (N=1, three customers at once) ==${C_0}"
-BARBER_WINDOW=0 SB_SPEED=300000 ./correct barber 1 </dev/null >/tmp/sb_c2_barber.log 2>&1 &
+SB_SPEED=300000 ./correct barber 1 </dev/null >/tmp/sb_c2_barber.log 2>&1 &
 bpid=$!
 sleep 0.5
 # Three customers arrive together but there is only one seat -> at least one

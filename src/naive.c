@@ -1,24 +1,27 @@
 /*
  * naive.c — the BROKEN barbershop (no proper synchronisation).
  *
- * Two terminals:
- *     ./naive barber      terminal 1: the barber
- *     ./naive customer    terminal 2: press ENTER to add a customer to the queue
- *     ./naive race [N]     (bonus) the lost-increment race on `waiting`
- *     ./naive reset        remove the shared shop
+ * Roles:
+ *     ./naive barber        terminal 1: the barber
+ *     ./naive customer      terminal 2: press ENTER to add a customer
+ *     ./naive deadlock [N]  reliably reproduce the lost-wakeup DEADLOCK
+ *     ./naive race [N]      (bonus) the lost-increment race on `waiting`
+ *     ./naive reset         remove the shared shop
  *
- * Every customer you add runs the SAME function (customer_body). Whether a
- * customer is served or lost depends only on TIMING:
+ * The bug: the barber checks the waiting room, finds it empty, and decides to
+ * sleep. Between that check and actually falling asleep there is an UNLOCKED
+ * window. A customer arriving in that window sees the barber still on his feet
+ * (barber_sleeping == 0), assumes it was noticed, and sits to wait WITHOUT
+ * sending a wake-up. The barber then sleeps on a waiting customer. Both block
+ * forever. DEADLOCK.
  *
- *   The barber looks at the waiting room, sees it empty, and starts to nod
- *   off. If you add a customer DURING that gap, the customer sees the barber
- *   still on his feet, assumes he was noticed, and sits to wait. The barber
- *   then falls asleep — and nobody ever wakes him. Both wait forever. DEADLOCK.
+ * That window is REAL but only a few instructions wide — nothing artificial
+ * holds it open. By hand (the two-terminal shop) you will almost always be
+ * served; the race is simply too narrow to hit on purpose. To see the bug
+ * reliably, `./naive deadlock` drives the SAME unsynchronised logic with two
+ * real threads and repeats it until the unlucky interleaving actually occurs.
  *
- * If instead you add a customer once the barber is already asleep, the
- * customer wakes him and gets served. Same function, different moment.
- *
- * To make the deadlock visible, the barber and any stuck customer print a
+ * To make a stuck shop visible, the barber and any stuck customer print a
  * "heartbeat" while blocked, so you watch them spin forever.
  */
 #define _GNU_SOURCE
@@ -29,6 +32,7 @@
 #include <semaphore.h>
 #include <signal.h>
 #include <pthread.h>
+#include <sched.h>
 #include <time.h>
 
 #define SHM_NAME "/sb_naive_shm"
@@ -83,23 +87,6 @@ static void attach_shop(void)
     if (wake == SEM_FAILED || cut == SEM_FAILED) die("sem_open");
 }
 
-/* The gap between "the room looks empty" and "I'm now asleep" — the bug window.
- * Interactive: a visible countdown (add a customer during it).
- * Tests: a fixed $BARBER_WINDOW seconds (0 = sleep immediately). */
-static void scheduler_gap(int secs)
-{
-    if (secs <= 0) {
-        printf(C_DIM "[barber] (the scheduler pauses me here for a moment)" C_RESET "\n");
-        fflush(stdout);
-        return;
-    }
-    for (int s = secs; s > 0; s--) {
-        printf(C_BARBER "[barber] ...about to nod off in %d  " C_DIM "(add a customer NOW to lose them)" C_RESET "\n", s);
-        fflush(stdout);
-        sleep(1);
-    }
-}
-
 /* ------------------------------------------------------------------ barber */
 static void run_barber(void)
 {
@@ -119,9 +106,6 @@ static void run_barber(void)
     shop->waiting = 0;
     shop->barber_sleeping = 0;
 
-    const char *win = getenv("BARBER_WINDOW");
-    int gap = win ? atoi(win) : 8;          /* interactive default: 8s window */
-
     printf(C_BARBER "[barber] Shop is open." C_RESET "\n");
 
     for (;;) {
@@ -129,15 +113,14 @@ static void run_barber(void)
             printf(C_BARBER "[barber] Waiting room looks empty. I'll take a nap." C_RESET "\n");
             fflush(stdout);
 
-            scheduler_gap(gap);                          /* T2: the bug window  */
+            /* THE BUG: nothing locks the gap between the check above and the
+             * sleep below. A customer arriving here reads barber_sleeping==0,
+             * assumes it was noticed, and never sends a wake-up. No artificial
+             * delay props this window open — it is just a few instructions, so
+             * by hand you will nearly always be served. `./naive deadlock`
+             * reproduces the unlucky interleaving reliably. */
+            shop->barber_sleeping = 1;                  /* T2: go to sleep */
 
-            shop->barber_sleeping = 1;                  /* T5: go to sleep anyway */
-
-            if (shop->waiting > 0) {                      /* the bug, made visible */
-                printf(C_WARN "[barber] !! Someone slipped in during my pause (waiting=%d)," C_RESET "\n", shop->waiting);
-                printf(C_WARN "         but I already decided the room was empty — I never rechecked." C_RESET "\n");
-                printf(C_WARN "         Their wake-up was LOST. I'm asleep on a waiting customer." C_RESET "\n");
-            }
             printf(C_BARBER "[barber] Zzz... (asleep, waiting for a wake-up)" C_RESET "\n");
             fflush(stdout);
             wait_with_heartbeat(wake, C_BARBER,
@@ -201,6 +184,98 @@ static void run_customer(void)
     for (long i = 0; i < n; i++) pthread_join(th[i], NULL);  /* lost ones block here */
 }
 
+/* --------------------------------------------- deadlock reproducer (real) --
+ * The same unsynchronised logic as the two-terminal shop, but driven by two
+ * real threads with NO artificial gap, repeated until the genuine lost-wakeup
+ * interleaving fires. We yield the CPU once at the race point — that is a real
+ * reschedule the kernel can do at any time, not a scripted countdown — so the
+ * narrow window the two-terminal demo rarely hits is exposed within a handful
+ * of trials. */
+typedef struct {
+    int   waiting;          /* unlocked, exactly like shop_t.waiting          */
+    int   barber_sleeping;  /* unlocked, exactly like shop_t.barber_sleeping  */
+    sem_t wake;             /* barber sleeps here; customer "wakes" him       */
+    sem_t cut;              /* customer waits here to be served               */
+    volatile int served;    /* set by the customer once it gets its haircut   */
+} trial_t;
+
+static void *dl_barber(void *arg)
+{
+    trial_t *t = arg;
+    if (t->waiting == 0) {              /* room looks empty                    */
+        sched_yield();                  /* real reschedule — exposes the window */
+        t->barber_sleeping = 1;         /* sleep, having never re-checked      */
+        sem_wait(&t->wake);             /* lost wake-up => blocks forever      */
+        t->barber_sleeping = 0;
+    }
+    t->waiting--;
+    sem_post(&t->cut);                  /* serve the customer                  */
+    return NULL;
+}
+
+static void *dl_customer(void *arg)
+{
+    trial_t *t = arg;
+    t->waiting++;                       /* arrive                              */
+    if (t->barber_sleeping)
+        sem_post(&t->wake);             /* barber asleep => wake him (safe)    */
+    /* else: barber on his feet — assume he noticed us (THE BUG: no wake sent) */
+    sem_wait(&t->cut);                  /* lost wake-up => blocks forever      */
+    t->served = 1;
+    return NULL;
+}
+
+static void run_deadlock(int max_trials)
+{
+    if (max_trials <= 0) max_trials = 100000;
+    printf(C_CUST "[deadlock] Racing barber vs. customer with NO artificial gap." C_RESET "\n");
+    printf(C_DIM  "[deadlock] Same unsynchronised logic as the shop; repeating until the\n"
+                  "           real lost-wakeup interleaving actually happens..." C_RESET "\n");
+    fflush(stdout);
+
+    for (int n = 1; n <= max_trials; n++) {
+        trial_t t = { .waiting = 0, .barber_sleeping = 0, .served = 0 };
+        sem_init(&t.wake, 0, 0);
+        sem_init(&t.cut, 0, 0);
+
+        pthread_t bt, ct;
+        pthread_create(&bt, NULL, dl_barber, &t);
+        pthread_create(&ct, NULL, dl_customer, &t);
+
+        /* A served trial finishes in microseconds. If the customer is still
+         * not served after the timeout, the wake-up was lost and both threads
+         * are blocked forever. */
+        int deadlocked = 1;
+        for (int i = 0; i < 100; i++) {        /* up to ~20ms */
+            if (t.served) { deadlocked = 0; break; }
+            usleep(200);
+        }
+
+        if (!deadlocked) {
+            pthread_join(bt, NULL);
+            pthread_join(ct, NULL);
+            sem_destroy(&t.wake);
+            sem_destroy(&t.cut);
+            if (n % 1000 == 0) {
+                printf(C_DIM "[deadlock] %d trials served so far, still racing...\n" C_RESET, n);
+                fflush(stdout);
+            }
+            continue;
+        }
+
+        /* Reproduced. The two threads are stuck on each other; report it and
+         * return (process teardown reaps them). */
+        printf(C_WARN "[deadlock] Trial %d: LOST WAKEUP." C_RESET "\n", n);
+        printf(C_WARN "  barber  : saw room==empty, then slept; never noticed the customer." C_RESET "\n");
+        printf(C_WARN "  customer: arrived after that check, saw barber awake, sent no wake-up." C_RESET "\n");
+        printf(C_WARN "  => barber blocked on `wake`, customer blocked on `cut`. DEADLOCK." C_RESET "\n");
+        printf(C_OK   "[deadlock] Reproduced from a REAL race after %d trial(s) — no manufactured gap." C_RESET "\n", n);
+        fflush(stdout);
+        return;
+    }
+    printf(C_OK "[deadlock] %d trials, no lost wake-up this run (timing-dependent — rerun)." C_RESET "\n", max_trials);
+}
+
 /* -------------------------------------------------- bonus: counter race ---- */
 static volatile long race_counter;
 static long race_iters;
@@ -234,11 +309,12 @@ static void run_race(int threads)
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s barber | customer | race [N] | reset\n", argv[0]);
+        fprintf(stderr, "usage: %s barber | customer | deadlock [N] | race [N] | reset\n", argv[0]);
         return 2;
     }
     if      (!strcmp(argv[1], "barber"))   run_barber();
     else if (!strcmp(argv[1], "customer")) run_customer();
+    else if (!strcmp(argv[1], "deadlock")) run_deadlock(argc > 2 ? atoi(argv[2]) : 0);
     else if (!strcmp(argv[1], "race"))     run_race(argc > 2 ? atoi(argv[2]) : 8);
     else if (!strcmp(argv[1], "reset"))    { cleanup(); printf("shop reset\n"); }
     else { fprintf(stderr, "unknown role: %s\n", argv[1]); return 2; }

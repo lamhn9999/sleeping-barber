@@ -15,8 +15,12 @@ Terminal 1:  ./naive barber        the barber
 Terminal 2:  ./naive customer      press ENTER to add a customer to the queue
 ```
 
-The headline demo is the **lost customer**: add a customer at exactly the wrong
-moment and the barber sleeps through them forever.
+The headline bug is the **lost customer**: if a customer arrives in the tiny
+window between the barber checking the room (empty) and actually falling
+asleep, its wake-up is never sent and the barber sleeps through it forever.
+That window is real but only a few instructions wide — too narrow to hit by
+hand — so `./naive deadlock` races a real barber against a real customer and
+repeats until the unlucky interleaving fires.
 
 The customer terminal logs the **waiting queue** after every change, e.g.
 `[queue] waiting room (2): Customer-1 Customer-2` — so you can watch it fill up
@@ -47,43 +51,47 @@ every role, chosen by its first argument:
 ```sh
 ./naive   barber          # start the (broken) shop
 ./naive   customer        # press ENTER to add a customer (every customer = same function)
+./naive   deadlock        # reliably reproduce the lost-wakeup deadlock (real race, no gap)
 ./naive   race 8          # bonus: the unsynchronised counter race
 ./naive   reset           # tear down the shared shop
 
 ./correct barber 3        # correct shop with 3 waiting seats
 ./correct customer        # press ENTER to add a customer
+./correct prove           # run the same race naive deadlocks on: none are lost
 ./correct reset
 ```
 
 ## The visual demo (two terminals, colour)
 
 ```sh
-./demo/lost_customer.sh     # NAIVE: add a customer mid-countdown -> deadlock
+./demo/lost_customer.sh     # NAIVE: real barber/customer race -> deadlock
 ./demo/served_correct.sh    # CORRECT: add customers any time -> all served
 ```
 
-Each opens a **BARBER** window and a **CUSTOMER** window (auto-detects
-`konsole`, `gnome-terminal`, `xfce4-terminal`, or `xterm`; falls back to
-printing the two commands if there is no graphical session).
+`lost_customer.sh` opens a **BARBER** window, a **CUSTOMER** window, and a
+**DEADLOCK** window (auto-detects `konsole`, `gnome-terminal`,
+`xfce4-terminal`, or `xterm`; falls back to printing the commands if there is
+no graphical session).
 
 ### Narrating the lost-customer demo
 
-1. The **barber** opens, sees an empty room, and starts an 8-second countdown
-   before napping: *"...about to nod off (add a customer NOW to lose them)"*.
-2. **To lose a customer:** press **ENTER in the CUSTOMER window during the
-   countdown**. The customer sees the barber still on his feet, assumes he was
-   noticed, and sits to wait.
-3. The countdown ends and the barber falls asleep. Now watch both windows
-   **heartbeat forever**:
-   - BARBER: `Zzz... still asleep — no wake-up arrived (DEADLOCK ...)`
-   - CUSTOMER: `still waiting — the barber never called me (am I LOST?)`
+There is **no artificial countdown** — the lost-wakeup window is the genuine
+one (a few instructions between the barber's "room is empty" check and his
+sleep).
 
-   The customer's wake-up was never sent. **Deadlock.**
-4. **For contrast** (fresh run): wait for the countdown to finish — the barber
-   says `Zzz...` — *then* press ENTER. The customer wakes him and is served.
+1. **BARBER + CUSTOMER** — the everyday shop. Press ENTER to add customers and
+   watch them get served. By hand the race is far too narrow to land in on
+   purpose, so this just shows the shop working.
+2. **DEADLOCK** — the reliable reproduction. `./naive deadlock` races a real
+   barber thread against a real customer thread, with no manufactured gap, and
+   repeats until the wake-up is genuinely lost:
+   - `[deadlock] Trial N: LOST WAKEUP.`
+   - `=> barber blocked on wake, customer blocked on cut. DEADLOCK.`
+   - `Reproduced from a REAL race after N trial(s) — no manufactured gap.`
 
-Same function both times; only the **moment you press ENTER** differs. Then run
-`./demo/served_correct.sh` to show the semaphore version never loses anyone.
+Only **repetition** makes the genuine race show up — nothing fakes the timing.
+Then run `./demo/served_correct.sh` to show the semaphore version never loses
+anyone.
 
 ## The correct algorithm (`src/correct.c`)
 
@@ -115,7 +123,8 @@ exactly what the naive version lacks, so no wake-up can be lost.
 
 1. **Lost wakeup** — the barber checks the room (empty) and, before he actually
    sleeps, a customer arrives, sees him standing, and waits to be noticed. The
-   barber then sleeps; nobody wakes him. **Deadlock.**
+   barber then sleeps; nobody wakes him. **Deadlock.** The window is a real,
+   narrow race (no artificial delay); `./naive deadlock` reproduces it reliably.
 2. **Race condition** — `waiting++` is `read; +1; write` with no lock, so
    concurrent customers overwrite each other's updates (`./naive race`).
 

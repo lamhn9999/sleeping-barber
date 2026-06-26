@@ -4,14 +4,16 @@
 #
 #     1. BARBER      — ./correct barber 3
 #     2. CUSTOMER    — ./correct customer  (press ENTER to add a customer)
+#     3. PROVE       — ./correct prove      (the fix, under the real race)
 #
-# The barber runs the SAME 8-second dozing-off countdown as the naive shop
-# ("...about to nod off"). In ./demo/lost_customer.sh, pressing ENTER DURING
-# that countdown loses the customer forever. Here, do the exact same thing —
-# press ENTER mid-countdown — and the customer is STILL served, because
-# signal(custReady) is remembered. That is the side-by-side payoff: identical
-# timing, opposite outcome. Add more customers than the 3 seats and the extras
-# leave cleanly ("waiting room is full").
+# There is no artificial countdown. By hand the barber/customer windows just
+# show the shop working: every ENTER is served, and more customers than the 3
+# seats leave cleanly ("waiting room is full").
+#
+# The payoff is the PROVE window: `./correct prove` runs the EXACT same thread
+# race that `./naive deadlock` loses (a sched_yield at the race point, no
+# manufactured gap), many times over, and every customer is served — because
+# signal(custReady) is remembered. Identical interleaving, opposite outcome.
 #
 set -u
 cd "$(dirname "$0")/.."
@@ -38,26 +40,32 @@ pkill -x correct 2>/dev/null
 
 if [ -z "$term" ] || [ -z "${DISPLAY:-}" ]; then
     cat <<EOF
-No graphical terminal detected. Open TWO terminals in $(pwd) and run:
+No graphical terminal detected. Open terminals in $(pwd) and run:
 
   Terminal 1 (barber):    ./correct barber 3
   Terminal 2 (customer):  ./correct customer    # press ENTER to add a customer
+  Terminal 3 (prove):     ./correct prove        # same real race naive loses
+
+The prove window serves every customer; the naive shop deadlocks on the same
+race (see ./naive deadlock).
 EOF
     exit 0
 fi
 
 launch "1-BARBER (correct)"   "SB_SPEED=$SB_SPEED ./correct barber 3"
 launch "2-CUSTOMER (correct)" "SB_SPEED=$SB_SPEED ./correct customer"
+launch "3-PROVE (correct)"    "./correct prove; echo; echo '(press ENTER to close)'; read"
 
 cat <<EOF
-Two windows opened:
-  1-BARBER     runs the SAME 8s countdown as the naive shop whenever it naps
-  2-CUSTOMER   press ENTER to add a customer to the queue
+Three windows opened:
+  1-BARBER     naps whenever the room is empty (no countdown — the real shop)
+  2-CUSTOMER   press ENTER to add a customer; they get served
+  3-PROVE      races a real barber vs. customer; every customer is served
 
-Do the EXACT move that loses a customer in ./demo/lost_customer.sh: press ENTER
-in the CUSTOMER window WHILE the barber is counting down. Here the customer is
-STILL served — same timing, opposite outcome. Press it 4+ times fast to fill the
-3 seats and watch the extra customer leave cleanly.
+Window 3 is the payoff: the SAME race that deadlocks ./naive deadlock serves
+everyone here, because signal(custReady) is remembered. Press ENTER 4+ times in
+the CUSTOMER window to fill the 3 seats and watch the extra customer leave
+cleanly.
 
 Close the demo with Ctrl-C in the BARBER window (it resets the shared shop).
 EOF

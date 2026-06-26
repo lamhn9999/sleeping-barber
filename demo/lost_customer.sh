@@ -2,29 +2,30 @@
 #
 # lost_customer.sh — VISUAL "lost customer" demo for the NAIVE shop.
 #
-# Two terminals only:
+# Three terminals:
 #     1. BARBER      — ./naive barber
-#     2. CUSTOMER    — ./naive customer  (press ENTER to add a customer)
+#     2. CUSTOMER    — ./naive customer    (press ENTER to add a customer)
+#     3. DEADLOCK    — ./naive deadlock     (reliably reproduces the bug)
 #
 # --------------------------------------------------------------------------
 # HOW TO RUN (narrate as you click):
 #
-#   The barber starts, sees an empty room, and begins an 8-second countdown
-#   before napping: "...about to nod off (add a customer NOW to lose them)".
+#   There is NO artificial countdown — the lost-wakeup window is the real one
+#   (a few instructions between the barber's "room is empty" check and his
+#   sleep). So:
 #
-#   * To LOSE a customer (the bug):
-#       press ENTER in the CUSTOMER window DURING the countdown.
-#       The customer sees the barber still on his feet and sits to wait.
-#       When the countdown ends the barber sleeps — and never wakes:
-#         BARBER  : "Zzz... still asleep — DEADLOCK..."   (forever)
-#         CUSTOMER: "still waiting — am I LOST?"           (forever)
+#   * BARBER + CUSTOMER  — the everyday shop. Press ENTER to add customers;
+#       they get served. By hand the race is far too narrow to hit on purpose,
+#       so this window mostly just shows the shop working.
 #
-#   * To SERVE a customer (for contrast, on a fresh run):
-#       wait for the countdown to finish (barber says "Zzz..."), THEN press
-#       ENTER. The customer wakes him and gets a haircut.
+#   * DEADLOCK  — the reliable reproduction. It races a real barber thread
+#       against a real customer thread, with no manufactured gap, repeating
+#       until the unlucky interleaving loses the wake-up:
+#         "LOST WAKEUP ... barber blocked on wake, customer blocked on cut"
+#         "Reproduced from a REAL race after N trial(s) — no manufactured gap"
 #
-#   Same function both times — only the moment you press ENTER differs.
-#   Compare with: ./demo/served_correct.sh
+#   Same logic in every window — only the timing differs, and only repetition
+#   makes the genuine race show up.  Compare with: ./demo/served_correct.sh
 # --------------------------------------------------------------------------
 set -u
 cd "$(dirname "$0")/.."
@@ -51,25 +52,30 @@ pkill -x naive 2>/dev/null
 
 if [ -z "$term" ] || [ -z "${DISPLAY:-}" ]; then
     cat <<EOF
-No graphical terminal detected. Open TWO terminals in $(pwd) and run:
+No graphical terminal detected. Open terminals in $(pwd) and run:
 
   Terminal 1 (barber):    ./naive barber
   Terminal 2 (customer):  ./naive customer    # press ENTER to add a customer
-                          (ENTER during the countdown -> LOST; after "Zzz..." -> served)
+  Terminal 3 (deadlock):  ./naive deadlock     # reliably reproduces the bug
+
+By hand the lost-wakeup race is too narrow to hit; `./naive deadlock` repeats
+the real race until it fires.
 EOF
     exit 0
 fi
 
 launch "1-BARBER (naive)"   "SB_SPEED=$SB_SPEED ./naive barber"
 launch "2-CUSTOMER (naive)" "SB_SPEED=$SB_SPEED ./naive customer"
+launch "3-DEADLOCK (naive)" "./naive deadlock; echo; echo '(press ENTER to close)'; read"
 
 cat <<EOF
-Two windows opened:
-  1-BARBER     starts an 8s countdown whenever the room is empty
-  2-CUSTOMER   press ENTER to add a customer to the queue
+Three windows opened:
+  1-BARBER     naps whenever the room is empty (no countdown — the real shop)
+  2-CUSTOMER   press ENTER to add a customer; by hand they get served
+  3-DEADLOCK   races a real barber vs. customer until the wake-up is LOST
 
-To see the LOST customer: press ENTER in the CUSTOMER window WHILE the barber
-is counting down. Then watch both windows heartbeat forever (deadlock).
+The headline bug is window 3: it reproduces the genuine deadlock from a real
+race, with no manufactured gap. Windows 1+2 show the everyday shop.
 
 Close the demo with Ctrl-C in the BARBER window (it resets the shared shop).
 EOF

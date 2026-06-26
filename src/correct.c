@@ -4,6 +4,7 @@
  * Same two-terminal format as the naive version:
  *     ./correct barber [N]   terminal 1: the barber (N waiting seats, default 3)
  *     ./correct customer     terminal 2: press ENTER to add a customer
+ *     ./correct prove [N]    race barber vs. customer N times: NONE are lost
  *     ./correct reset        remove the shared shop
  *
  * Faithful implementation of the classic solution:
@@ -16,8 +17,13 @@
  * The naive lost-wakeup cannot happen here: a customer always
  * signal(custReady) when it sits down, and the semaphore REMEMBERS that
  * signal even if the barber has not reached wait(custReady) yet. No matter
- * WHEN you press ENTER, the customer is served (or cleanly turned away if the
+ * WHEN the customer arrives, it is served (or cleanly turned away if the
  * waiting room is full).
+ *
+ * There is no artificial timing window. `./correct prove` runs the SAME real
+ * race that `./naive deadlock` loses — two threads, a sched_yield() at the
+ * exact race point, no manufactured gap — and shows every customer is served.
+ * Identical interleaving, opposite outcome.
  */
 #define _GNU_SOURCE
 #include "common.h"
@@ -27,6 +33,7 @@
 #include <semaphore.h>
 #include <signal.h>
 #include <pthread.h>
+#include <sched.h>
 
 #define SHM_NAME   "/sb_correct_shm"
 #define SEM_BARBER "/sb_correct_barberReady"
@@ -68,27 +75,6 @@ static void attach_shop(void)
     if (barberReady == SEM_FAILED || accessWRSeats == SEM_FAILED || custReady == SEM_FAILED) die("sem_open");
 }
 
-/* The SAME dozing-off window the naive barber has, inserted right before the
- * barber commits to sleeping on custReady. In the naive shop a customer who
- * arrives during this gap is LOST. Here it is the proof of the fix: a customer
- * who arrives in the gap has already done signal(custReady), the semaphore
- * REMEMBERS that signal, and so the sem_wait(custReady) just below returns
- * immediately instead of blocking forever.
- * Interactive: a visible countdown. Tests: a fixed $BARBER_WINDOW seconds. */
-static void scheduler_gap(int secs)
-{
-    if (secs <= 0) {
-        printf(C_DIM "[barber] (the scheduler pauses me here for a moment)" C_RESET "\n");
-        fflush(stdout);
-        return;
-    }
-    for (int s = secs; s > 0; s--) {
-        printf(C_BARBER "[barber] ...about to nod off in %d  " C_DIM "(add a customer NOW — they'll STILL be served)" C_RESET "\n", s);
-        fflush(stdout);
-        sleep(1);
-    }
-}
-
 /* ------------------------------------------------------------------ barber */
 static void run_barber(int seats)
 {
@@ -108,20 +94,18 @@ static void run_barber(int seats)
     if (shop == MAP_FAILED) die("mmap");
     shop->numberOfFreeWRSeats = seats;
 
-    const char *win = getenv("BARBER_WINDOW");
-    int gap = win ? atoi(win) : 8;          /* interactive default: 8s window */
-
     printf(C_BARBER "[barber] Shop is open with %d waiting-room seats." C_RESET "\n", seats);
 
     for (;;) {                              /* def Barber(): while true */
         /* Mirror the naive barber: if nobody is waiting right now, announce a
-         * nap and run the SAME bug window before committing to sleep. The only
-         * difference is the line that follows — and it is the whole point. */
+         * nap and commit to sleeping on custReady. The decisive difference is
+         * that custReady is a COUNTING semaphore — a customer arriving in the
+         * race window below already did signal(custReady), and the semaphore
+         * REMEMBERS it, so the wait returns instead of blocking forever. */
         if (sem_trywait(custReady) != 0) {  /* no customer is ready this instant */
             printf(C_BARBER "[barber] Waiting room looks empty. I'll take a nap." C_RESET "\n");
             fflush(stdout);
-            scheduler_gap(gap);             /* the deadlock-ignition window      */
-            sem_wait(custReady);            /* wait(custReady) — REMEMBERS a post made during the gap */
+            sem_wait(custReady);            /* wait(custReady) — REMEMBERS a post made in the race window */
         }                                   /* (else: sem_trywait already took a waiting customer) */
         sem_wait(accessWRSeats);            /* wait(accessWRSeats) */
         shop->numberOfFreeWRSeats += 1;     /* a chair frees up    */
@@ -183,14 +167,99 @@ static void run_customer(void)
     for (long i = 0; i < n; i++) pthread_join(th[i], NULL);
 }
 
+/* -------------------------------------------- proof: the race never loses --
+ * The exact counterpart to `./naive deadlock`: the SAME unsynchronised-looking
+ * race (a customer arriving in the window between the barber finding the room
+ * empty and committing to sleep), driven by two real threads with a sched_yield
+ * at the race point and NO artificial gap. Where the naive shop deadlocks, the
+ * three semaphores serve every customer — we repeat it many times to show the
+ * fix holds under the genuine interleaving, not a staged one. */
+typedef struct {
+    int   numberOfFreeWRSeats;   /* protected by accessWRSeats              */
+    sem_t barberReady, accessWRSeats, custReady;
+    volatile int served;         /* set once the customer gets its haircut  */
+} ptrial_t;
+
+static void *cp_barber(void *arg)
+{
+    ptrial_t *t = arg;
+    if (sem_trywait(&t->custReady) != 0) {  /* room looks empty this instant */
+        sched_yield();                       /* real reschedule — same race point */
+        sem_wait(&t->custReady);             /* REMEMBERS a post made in the window */
+    }
+    sem_wait(&t->accessWRSeats);
+    t->numberOfFreeWRSeats += 1;
+    sem_post(&t->barberReady);               /* call the customer to the chair */
+    sem_post(&t->accessWRSeats);
+    return NULL;
+}
+
+static void *cp_customer(void *arg)
+{
+    ptrial_t *t = arg;
+    sem_wait(&t->accessWRSeats);
+    if (t->numberOfFreeWRSeats > 0) {
+        t->numberOfFreeWRSeats -= 1;
+        sem_post(&t->custReady);             /* ALWAYS announce — cannot be lost */
+        sem_post(&t->accessWRSeats);
+        sem_wait(&t->barberReady);           /* served (never blocks forever)    */
+        t->served = 1;
+    } else {
+        sem_post(&t->accessWRSeats);
+    }
+    return NULL;
+}
+
+static void run_prove(int trials)
+{
+    if (trials <= 0) trials = 20000;
+    printf(C_BARBER "[prove] Racing barber vs. customer %d times — the SAME race", trials);
+    printf(" that\n        ./naive deadlock loses, with NO artificial gap." C_RESET "\n");
+    fflush(stdout);
+
+    int served = 0;
+    for (int n = 1; n <= trials; n++) {
+        ptrial_t t = { .numberOfFreeWRSeats = 1, .served = 0 };
+        sem_init(&t.barberReady,   0, 0);
+        sem_init(&t.accessWRSeats, 0, 1);
+        sem_init(&t.custReady,     0, 0);
+
+        pthread_t bt, ct;
+        pthread_create(&bt, NULL, cp_barber, &t);
+        pthread_create(&ct, NULL, cp_customer, &t);
+
+        /* The fix guarantees both threads finish; a lost wake-up would hang
+         * here, so a timeout would be a real FAILURE. */
+        int ok = 0;
+        for (int i = 0; i < 100; i++) {        /* up to ~20ms */
+            if (t.served) { ok = 1; break; }
+            usleep(200);
+        }
+        if (!ok) {
+            printf(C_WARN "[prove] Trial %d: customer NOT served — the fix is broken!" C_RESET "\n", n);
+            return;                            /* leave the hung threads; bail */
+        }
+        pthread_join(bt, NULL);
+        pthread_join(ct, NULL);
+        sem_destroy(&t.barberReady);
+        sem_destroy(&t.accessWRSeats);
+        sem_destroy(&t.custReady);
+        served++;
+    }
+    printf(C_OK "[prove] %d/%d customers served, 0 lost — no wake-up can be dropped." C_RESET "\n",
+           served, trials);
+    printf(C_DIM "[prove] Same interleaving as ./naive deadlock; opposite outcome." C_RESET "\n");
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s barber [N] | customer | reset\n", argv[0]);
+        fprintf(stderr, "usage: %s barber [N] | customer | prove [N] | reset\n", argv[0]);
         return 2;
     }
     if      (!strcmp(argv[1], "barber"))   run_barber(argc > 2 ? atoi(argv[2]) : 3);
     else if (!strcmp(argv[1], "customer")) run_customer();
+    else if (!strcmp(argv[1], "prove"))    run_prove(argc > 2 ? atoi(argv[2]) : 0);
     else if (!strcmp(argv[1], "reset"))    { cleanup(); printf("shop reset\n"); }
     else { fprintf(stderr, "unknown role: %s\n", argv[1]); return 2; }
     return 0;
